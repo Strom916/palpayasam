@@ -1,0 +1,476 @@
+#include "main.h"
+
+CAimbot* pAimbot;
+
+static float DeltaTime()
+{
+	static ULONGLONG last = GetTickCount64();
+	ULONGLONG now = GetTickCount64();
+	float dt = (now - last) / 1000.f;
+	last = now;
+	return (dt > 0.1f) ? 0.1f : dt;
+}
+
+// ─── Update ─────────────────────────────────────────────────────────────────
+
+void CAimbot::Update()
+{
+	int iMode = TheCamera.m_aCams[0].m_nMode;
+	bCrosshair = iMode == 53 || iMode == 7;
+
+	if (pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon != 34)
+	{
+		vecCrosshair.fX = ImGui::GetIO().DisplaySize.x * 0.5299999714f;
+		vecCrosshair.fY = ImGui::GetIO().DisplaySize.y * 0.4f;
+	}
+	else
+	{
+		vecCrosshair.fX = ImGui::GetIO().DisplaySize.x / 2.f;
+		vecCrosshair.fY = ImGui::GetIO().DisplaySize.y / 2.f;
+	}
+
+	GetAimingPlayer();
+	SmoothAimbot();
+	ProAimbot();
+	Triggerbot();
+}
+
+// ─── Render ─────────────────────────────────────────────────────────────────
+
+void CAimbot::Render()
+{
+	BYTE weapon = pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon;
+	if (bCrosshair && g_Config.g_Aimbot.bAimbot && g_Config.g_Aimbot.bAimbotEnabled[weapon])
+	{
+		if (g_Config.g_Aimbot.bDrawRange)
+		{
+			float r = (float)g_Config.g_Aimbot.iAimbotConfig[weapon][RANGE];
+			if (!g_Config.g_Aimbot.iRangeStyle)
+				pRender->DrawCircleFilled(vecCrosshair, r, g_Config.g_Aimbot.colorRange);
+			else
+				pRender->DrawCircle(vecCrosshair, r, g_Config.g_Aimbot.colorRange, g_Config.g_Aimbot.fOutlineThickness);
+		}
+
+		if (g_Config.g_Aimbot.bDrawTracer && iTargetPlayer != -1)
+			pRender->DrawLine(vecCrosshair, vecTargetBone, ImColor(0.f, 1.f, 0.f), g_Config.g_Aimbot.fOutlineThickness);
+	}
+}
+
+// ─── GetAimingPlayer ────────────────────────────────────────────────────────
+
+void CAimbot::GetAimingPlayer()
+{
+	iTargetPlayer = -1;
+	float fNearestDistance = 9999.f;
+
+	if (!(g_Config.g_Aimbot.bAimbot || g_Config.g_Aimbot.bSmooth ||
+		g_Config.g_Aimbot.bSilent || g_Config.g_Aimbot.bProAim))
+		return;
+
+	CVector vecCamera, vecOrigin, vecTarget;
+	Utils::getBonePosition(FindPlayerPed(), BONE_RIGHTWRIST, &vecOrigin);
+	TheCamera.Find3rdPersonCamTargetVector(100.f, vecOrigin, &vecCamera, &vecTarget);
+
+	float dt = DeltaTime();
+	BYTE weapon = pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon;
+	float fRange = (float)g_Config.g_Aimbot.iAimbotConfig[weapon][RANGE] * 1.5f;
+
+	for (int i = 0; i < SAMP_MAX_PLAYERS; i++)
+	{
+		if (!pSAMP->isPlayerStreamed(i)) continue;
+
+		CPed* pPed = CPools::GetPed(
+			pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+		if (!pPed || !pPed->IsAlive()) continue;
+
+		if (g_Config.g_Aimbot.bTeamProtect &&
+			pSAMP->getPlayerColor(i) == pSAMP->getPlayerColor(pSAMP->getPlayers()->sLocalPlayerID))
+			continue;
+
+		if (!g_Config.g_Aimbot.bIgnoreEverything)
+		{
+			if (g_Config.g_Aimbot.bIgnoreAFK &&
+				pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->iAFKState == 2)
+				continue;
+
+			float fDist = Math::vect3_dist(
+				&pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->pSAMP_Actor->pGTA_Ped->base.matrix[12],
+				&pSAMP->getPlayers()->pLocalPlayer->pSAMP_Actor->pGTA_Ped->base.matrix[12]);
+			if (!g_Config.g_Aimbot.bIgnoreMaxDistance &&
+				fDist > fWeaponRange[weapon])
+				continue;
+		}
+
+		for (int iBone = 0; iBone < _countof(iBoneList); iBone++)
+		{
+			CVector vecBone, vecBoneScreen;
+			Utils::getBonePosition(pPed, (ePedBones)iBoneList[iBone], &vecBone);
+			Utils::CalcScreenCoors(&vecBone, &vecBoneScreen);
+			if (vecBoneScreen.fZ < 1.0f) continue;
+
+			float fCentreDistance = Math::vect2_dist(&vecCrosshair, &vecBoneScreen);
+
+			// range gate: ALL bones must pass, including chest
+			// chest bypasses the SCORE distance term only — not the range circle
+			if (g_Config.g_Aimbot.bAimbot && fCentreDistance >= fRange)
+				continue;
+
+			if (!g_Config.g_Aimbot.bIgnoreEverything &&
+				!g_Config.g_Aimbot.bLockThroughObjects &&
+				!CWorld::GetIsLineOfSightClear(vecCamera, vecBone, true, true, false, true, true, true, false))
+				continue;
+
+			// scoring:
+			// chest cluster (indices 0-3): pure priority, no distance term
+			// all others: distance + penalty
+			float fScore;
+			if (iBone <= 3)
+				fScore = fBonePriority[iBone];
+			else
+				fScore = fCentreDistance + fBonePriority[iBone];
+
+			if (fScore <= fNearestDistance)
+			{
+				fNearestDistance = fScore;
+				iTargetPlayer = i;
+				iTargetBone = iBoneList[iBone];
+				vecTargetBone = vecBoneScreen;
+
+				// UPPERTORSO confirmed exposed — stop scanning this player
+				if (iBone == 0) break;
+			}
+		}
+	}
+
+	// velocity tracking state update
+	if (iTargetPlayer != -1)
+	{
+		CPed* pPed = CPools::GetPed(
+			pSAMP->getPlayers()->pRemotePlayer[iTargetPlayer]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+		if (pPed)
+		{
+			CVector vecBoneNow;
+			Utils::getBonePosition(pPed, (ePedBones)iTargetBone, &vecBoneNow);
+			vecLastBonePos = vecBoneNow;
+			fLastBoneTime = dt;
+		}
+	}
+}
+
+// ─── hooks ──────────────────────────────────────────────────────────────────
+
+bool __stdcall CAimbot::Hooked_FireInstantHit(
+	void* this_, CEntity* pFiringEntity, CVector* pOrigin, CVector* pMuzzle,
+	CEntity* pTargetEntity, CVector* pTarget, CVector* pVec,
+	bool bCrossHairGun, bool bCreateGunFx)
+{
+	BYTE weapon = pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon;
+	if (pFiringEntity == (CEntity*)FindPlayerPed() &&
+		g_Config.g_Aimbot.bSilent &&
+		pAimbot->iTargetPlayer != -1 &&
+		g_Config.g_Aimbot.bAimbotEnabled[weapon] &&
+		rand() % 100 <= g_Config.g_Aimbot.iAimbotConfig[weapon][SILENT])
+	{
+		CPed* pPed = CPools::GetPed(
+			pSAMP->getPlayers()->pRemotePlayer[pAimbot->iTargetPlayer]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+		if (pPed)
+		{
+			CVector vecCamera, vecOrigin, vecTarget;
+			Utils::getBonePosition(FindPlayerPed(), BONE_RIGHTWRIST, &vecOrigin);
+			TheCamera.Find3rdPersonCamTargetVector(100.f, vecOrigin, &vecCamera, &vecTarget);
+			if (pAimbot->bCrosshair) pOrigin = &vecCamera;
+
+			CVector vecBone;
+			Utils::getBonePosition(pPed, (ePedBones)pAimbot->iTargetBone, &vecBone);
+			pTarget = &vecBone;
+
+			pSecure->memcpy_safe((void*)0x740B4E,
+				g_Config.g_Aimbot.bLockThroughObjects || g_Config.g_Aimbot.bIgnoreEverything
+				? "\x6A\x00\x6A\x00" : "\x6A\x01\x6A\x01", 4);
+		}
+	}
+	else
+	{
+		Memory::memcpy_safe((void*)0x740B4E, "\x6A\x01\x6A\x01", 4);
+	}
+
+	// FIX: no-spread patch — zero accuracy byte and spread scalar on every shot
+	// 0x8D610F = CWeapon accuracy (0x00 = perfect)
+	// 0x8D6114 = bullet spread scalar (0.f = no spread)
+	if (g_Config.g_Aimbot.bNoSpread)
+	{
+		pSecure->memcpy_safe((void*)0x8D610F, "\x00", 1);
+		pSecure->memcpy_safe((void*)0x8D6114, "\x00\x00\x00\x00", 4);
+	}
+
+	return pAimbot->Orginal_FireInstantHit(this_, pFiringEntity, pOrigin, pMuzzle,
+		pTargetEntity, pTarget, pVec, bCrossHairGun, bCreateGunFx);
+}
+
+bool __cdecl CAimbot::Hooked_AddBullet(
+	CEntity* pCreator, eWeaponType weaponType, CVector vecPosition, CVector vecVelocity)
+{
+	if (pCreator == (CEntity*)FindPlayerPed() &&
+		g_Config.g_Aimbot.bSilent &&
+		pAimbot->iTargetPlayer != -1 &&
+		g_Config.g_Aimbot.bAimbotEnabled[34] &&
+		rand() % 100 <= g_Config.g_Aimbot.iAimbotConfig[34][SILENT])
+	{
+		CPed* pPed = CPools::GetPed(
+			pSAMP->getPlayers()->pRemotePlayer[pAimbot->iTargetPlayer]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+		if (pPed)
+		{
+			CVector vecBone;
+			Utils::getBonePosition(pPed, (ePedBones)pAimbot->iTargetBone, &vecBone);
+			vecVelocity = vecBone - vecPosition;
+
+			pSecure->memcpy_safe((void*)0x736212,
+				g_Config.g_Aimbot.bLockThroughObjects || g_Config.g_Aimbot.bIgnoreEverything
+				? "\x6A\x00\x6A\x00" : "\x6A\x01\x6A\x01", 4);
+		}
+	}
+	else Memory::memcpy_safe((void*)0x736212, "\x6A\x01\x6A\x01", 4);
+
+	// FIX: no-spread for sniper/AddBullet path — same patch, same frame
+	if (g_Config.g_Aimbot.bNoSpread)
+	{
+		pSecure->memcpy_safe((void*)0x8D610F, "\x00", 1);
+		pSecure->memcpy_safe((void*)0x8D6114, "\x00\x00\x00\x00", 4);
+	}
+
+	return pAimbot->Orginal_AddBullet(pCreator, weaponType, vecPosition, vecVelocity);
+}
+
+float __cdecl CAimbot::Hooked_TargetWeaponRangeMultiplier(CEntity* pVictim, CEntity* pOwner)
+{
+	if (pOwner == (CEntity*)FindPlayerPed() &&
+		(g_Config.g_Aimbot.bIgnoreMaxDistance || g_Config.g_Aimbot.bIgnoreEverything))
+		return 100.f;
+	return pAimbot->Orginal_TargetWeaponRangeMultiplier(pVictim, pOwner);
+}
+
+// ─── SmoothAimbot ───────────────────────────────────────────────────────────
+
+void CAimbot::SmoothAimbot()
+{
+	BYTE byteWeapon = pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon;
+
+	if (!g_Config.g_Aimbot.bSmooth ||
+		!g_Config.g_Aimbot.bAimbotEnabled[byteWeapon] ||
+		iTargetPlayer == -1 || !bCrosshair)
+		return;
+
+	if (g_Config.g_Aimbot.bSmoothIsFire && !GetAsyncKeyState(VK_LBUTTON))
+		return;
+
+	CPed* pPed = CPools::GetPed(
+		pSAMP->getPlayers()->pRemotePlayer[iTargetPlayer]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+	if (!pPed) return;
+
+	if (g_Config.g_Aimbot.bStopOnBody)
+	{
+		CVector vecCamera, vecOrigin, vecTarget;
+		if (byteWeapon != 34)
+		{
+			Utils::getBonePosition(FindPlayerPed(), BONE_RIGHTWRIST, &vecOrigin);
+			TheCamera.Find3rdPersonCamTargetVector(100.f, vecOrigin, &vecCamera, &vecTarget);
+		}
+		else
+		{
+			CVector vecFront = TheCamera.m_aCams[0].m_vecFront;
+			vecFront.Normalise();
+			vecOrigin = *TheCamera.GetGameCamPosition();
+			vecOrigin += vecFront * 2.0f;
+			vecTarget = vecOrigin + vecFront * 100.f;
+			vecCamera = vecOrigin;
+		}
+		CColPoint pCol; CEntity* pColEnt = nullptr;
+		bool bCol = CWorld::ProcessLineOfSight(vecCamera, vecTarget, pCol, pColEnt,
+			!g_Config.g_Aimbot.bLockThroughObjects, !g_Config.g_Aimbot.bLockThroughObjects,
+			true, true, true, true, false, true);
+		if (bCol && pColEnt && pColEnt->m_nType == ENTITY_TYPE_PED && pColEnt == (CEntity*)pPed)
+			return;
+	}
+
+	CVector vecBoneWorld;
+	Utils::getBonePosition(pPed, (ePedBones)iTargetBone, &vecBoneWorld);
+
+	CVector vecCamPos = *TheCamera.GetGameCamPosition();
+
+	// direction FROM camera TO bone
+	CVector vecVec;
+	vecVec.fX = vecBoneWorld.fX - vecCamPos.fX;
+	vecVec.fY = vecBoneWorld.fY - vecCamPos.fY;
+	vecVec.fZ = vecBoneWorld.fZ - vecCamPos.fZ;
+
+	float fFix = 0.f;
+	if ((byteWeapon >= 22 && byteWeapon <= 29) || byteWeapon == 32) fFix = 0.04253f;
+	else if (byteWeapon == 30 || byteWeapon == 31)                   fFix = 0.028f;
+	else if (byteWeapon == 33)                                        fFix = 0.01897f;
+
+	float* fAspectRatio    = (float*)0xC3EFA4;
+	float* fCrosshairOffset = (float*)0xB6EC10;
+
+	// FIX: default both corrections to 0.f — original code defaulted to M_PI/2
+	// which subtracted ~1.57 rad from vertical even in non-aim camera modes,
+	// pushing fDesiredV below the floor and making the camera snap high into the air
+	float fFOVCorr_H = 0.f;
+	float fFOVCorr_V = 0.f;
+
+	int camMode = TheCamera.m_aCams[0].m_nMode;
+	if (camMode == 53 || camMode == 55)
+	{
+		float fMult = tan(TheCamera.FindCamFOV() / 2.0f * 0.017453292f);
+		fFOVCorr_H = M_PI - atan2(1.0f, fMult * ((1.0f - fCrosshairOffset[0] * 2.0f) * (1.0f / *fAspectRatio)));
+		fFOVCorr_V = M_PI - atan2(1.0f, fMult * (fCrosshairOffset[1] * 2.0f - 1.0f));
+	}
+
+	int   iSmooth  = g_Config.g_Aimbot.iAimbotConfig[byteWeapon][SMOOTH];
+	float fDivisor = max((float)(iSmooth * 2), 1.f);
+
+	// ── horizontal ───────────────────────────────────────────────────────────
+	float fDistXY = sqrtf(vecVec.fX * vecVec.fX + vecVec.fY * vecVec.fY);
+	if (fDistXY < 0.0001f) return;
+
+	float fDesiredH = atan2f(vecVec.fY, vecVec.fX) + fFix;
+	float fErrH     = fDesiredH - TheCamera.m_aCams[0].m_fHorizontalAngle + fFOVCorr_H;
+
+	while (fErrH >  (float)M_PI) fErrH -= 2.f * (float)M_PI;
+	while (fErrH < -(float)M_PI) fErrH += 2.f * (float)M_PI;
+
+	float fStepH = fErrH / fDivisor;
+
+	// FIX: removed the `fabsf(fErrH) < 2.0f` guard — that gate blocked all
+	// movement on acquisition when the player was more than ~115° off-angle.
+	// only sanity-clamp the per-frame step to prevent a single-frame snap.
+	if (fabsf(fStepH) < 1.0f)
+		TheCamera.m_aCams[0].m_fHorizontalAngle += fStepH;
+
+	// ── vertical ─────────────────────────────────────────────────────────────
+	if (g_Config.g_Aimbot.bSmoothLockY)
+	{
+		// atan2(fDistXY, -vecVec.fZ):
+		// fDistXY    = horizontal ground distance to target
+		// -vecVec.fZ = negate so angle is positive when target is below camera
+		float fDesiredV = atan2f(fDistXY, -vecVec.fZ) - fFOVCorr_V;
+		float fErrV     = fDesiredV - TheCamera.m_aCams[0].m_fVerticalAngle;
+
+		while (fErrV >  (float)M_PI) fErrV -= 2.f * (float)M_PI;
+		while (fErrV < -(float)M_PI) fErrV += 2.f * (float)M_PI;
+
+		float fStepV = fErrV / fDivisor;
+
+		// FIX: same guard removal as horizontal — was killing vertical lock entirely
+		if (fabsf(fStepV) < 1.0f)
+			TheCamera.m_aCams[0].m_fVerticalAngle += fStepV;
+	}
+}
+
+void CAimbot::ProAimbot()
+{
+	BYTE weapon = pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon;
+	if (!g_Config.g_Aimbot.bProAim ||
+		!g_Config.g_Aimbot.bAimbotEnabled[weapon] ||
+		iTargetPlayer == -1 || !bCrosshair || !GetAsyncKeyState(VK_LBUTTON))
+		return;
+
+	CPed* pPed = CPools::GetPed(
+		pSAMP->getPlayers()->pRemotePlayer[iTargetPlayer]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+	if (!pPed) return;
+
+	CVector vecCamera, vecOrigin, vecTarget;
+	if (weapon != 34)
+	{
+		Utils::getBonePosition(FindPlayerPed(), BONE_RIGHTWRIST, &vecOrigin);
+		TheCamera.Find3rdPersonCamTargetVector(2.f, vecOrigin, &vecCamera, &vecTarget);
+	}
+	else
+	{
+		CVector vecFront = TheCamera.m_aCams[0].m_vecFront;
+		vecFront.Normalise();
+		vecOrigin = *TheCamera.GetGameCamPosition();
+		vecOrigin += vecFront * 2.0f;
+		vecTarget = vecOrigin + vecFront * 1.5f;
+	}
+	pPed->SetPosn(vecTarget);
+}
+
+// ─── Triggerbot ─────────────────────────────────────────────────────────────
+
+void CAimbot::Triggerbot()
+{
+	BYTE weapon = pSAMP->getPlayers()->pLocalPlayer->byteCurrentWeapon;
+	if (!g_Config.g_Aimbot.bTriggerbot ||
+		!g_Config.g_Aimbot.bAimbotEnabled[weapon] || !bCrosshair)
+		return;
+
+	static ULONGLONG iTick = GetTickCount64();
+	if (g_Config.g_Aimbot.bTriggerDelay &&
+		GetTickCount64() - iTick < (ULONGLONG)g_Config.g_Aimbot.iTriggerDelay)
+		return;
+
+	if (g_Config.g_Aimbot.bTriggerSync)
+	{
+		if (g_Config.g_Aimbot.bSilent && g_Config.g_Aimbot.bAimbot && iTargetPlayer != -1)
+		{
+			pKeyHook->gameKeyState[BUTTON_CIRCLE] = 0xFF;
+			iTick = GetTickCount64();
+		}
+		return;
+	}
+
+	CVector vecCamera, vecOrigin, vecTarget;
+	if (weapon != 34)
+	{
+		Utils::getBonePosition(FindPlayerPed(), BONE_RIGHTWRIST, &vecOrigin);
+		TheCamera.Find3rdPersonCamTargetVector(100.f, vecOrigin, &vecCamera, &vecTarget);
+	}
+	else
+	{
+		CVector vecFront = TheCamera.m_aCams[0].m_vecFront;
+		vecFront.Normalise();
+		vecOrigin = *TheCamera.GetGameCamPosition();
+		vecOrigin += vecFront * 2.0f;
+		vecTarget = vecOrigin + vecFront * 100.f;
+		vecCamera = vecOrigin;
+	}
+
+	CColPoint pCol; CEntity* pColEnt = nullptr;
+	bool bCol = CWorld::ProcessLineOfSight(vecCamera, vecTarget, pCol, pColEnt,
+		!g_Config.g_Aimbot.bLockThroughObjects, !g_Config.g_Aimbot.bLockThroughObjects,
+		true, true, true, true, false, true);
+
+	if (!bCol || !pColEnt || pColEnt->m_nType != ENTITY_TYPE_PED) return;
+
+	for (int i = 0; i < SAMP_MAX_PLAYERS; i++)
+	{
+		if (!pSAMP->isPlayerStreamed(i)) continue;
+
+		CPed* pPed = CPools::GetPed(
+			pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->pSAMP_Actor->ulGTAEntityHandle);
+		if (!pPed || pPed == FindPlayerPed()) continue;
+		if (pColEnt != (CEntity*)pPed) continue;
+		if (pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->pSAMP_Actor->pGTA_Ped->hitpoints <= 0.f) continue;
+
+		if (g_Config.g_Aimbot.bTeamProtect &&
+			pSAMP->getPlayerColor(i) == pSAMP->getPlayerColor(pSAMP->getPlayers()->sLocalPlayerID))
+			continue;
+
+		if (!g_Config.g_Aimbot.bIgnoreEverything)
+		{
+			if (g_Config.g_Aimbot.bIgnoreAFK &&
+				pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->iAFKState == 2)
+				continue;
+
+			float fDist = Math::vect3_dist(
+				&pSAMP->getPlayers()->pRemotePlayer[i]->pPlayerData->pSAMP_Actor->pGTA_Ped->base.matrix[12],
+				&pSAMP->getPlayers()->pLocalPlayer->pSAMP_Actor->pGTA_Ped->base.matrix[12]);
+			if (!g_Config.g_Aimbot.bIgnoreMaxDistance && fDist > fWeaponRange[weapon])
+				continue;
+		}
+
+		pKeyHook->gameKeyState[BUTTON_CIRCLE] = 0xFF;
+		iTick = GetTickCount64();
+		break;
+	}
+}

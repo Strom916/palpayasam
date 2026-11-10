@@ -1,0 +1,8 @@
+StealthRemastered/Stealth Remastered.vcxproj
+StealthRemastered/Features/Combat.cpp
+StealthRemastered/Features/Visuals.cpp
+StealthRemastered/Cheat/Utils.h
+StealthRemastered/Cheat/Utils.cpp
+StealthRemastered/SAMP/SAMP.h
+StealthRemastered/SAMP/SAMP.cpp
+StealthRemastered/SAMP/RakNet/RakClient.cpp

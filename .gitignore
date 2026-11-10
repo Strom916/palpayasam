@@ -1,0 +1,24 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.cache
+
+# Precompiled headers
+*.pch
+*.ipch
+
+# Compiled object files
+*.obj
+*.idb
+*.ilk
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+
+# Temporary files
+*.tmp
+*.log
